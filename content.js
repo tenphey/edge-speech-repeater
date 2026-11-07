@@ -16,15 +16,26 @@
 
   const REPEAT_COUNT = 10;
   const RATE = 0.8;
-  const PAUSE_PER_SPACE = 250; // milliseconds
+  const PAUSE_PER_SPACE = 300;
 
   const BUTTON_OFFSET_X = -12;
   const BUTTON_OFFSET_Y = 8;
+
+  const START_TIMEOUT_MS = 5000;
+  const END_TIMEOUT_BASE_MS = 10000;
+  const END_TIMEOUT_PER_CHARACTER_MS = 500;
 
   const synth = window.speechSynthesis;
 
   let selectedText = "";
   let currentToken = 0;
+  let activePass = null;
+
+  const wait = ms =>
+    new Promise(resolve => setTimeout(resolve, ms));
+
+  const engineBusy = () =>
+    synth.speaking || synth.pending;
 
   // ========================================
   // Floating Play Button
@@ -74,7 +85,7 @@
     gap: "12px",
     borderRadius: "6px",
     fontFamily: "Verdana, sans-serif",
-    fontSize: "30px",
+    fontSize: "18px",
     lineHeight: "1.5",
     boxShadow: "0 2px 8px rgba(0,0,0,0.35)"
   });
@@ -99,7 +110,7 @@
     border: "1px solid #ffff00",
     borderRadius: "4px",
     fontFamily: "Verdana, sans-serif",
-    fontSize: "30px",
+    fontSize: "14px",
     fontWeight: "400",
     fontVariantNumeric: "tabular-nums"
   });
@@ -114,7 +125,7 @@
     minWidth: "0",
     overflowWrap: "anywhere",
     fontFamily: "Verdana, sans-serif",
-    fontSize: "30px",
+    fontSize: "18px",
     fontWeight: "400"
   });
 
@@ -123,6 +134,7 @@
   // ========================================
 
   const stopButton = document.createElement("button");
+
   stopButton.textContent = "■";
   stopButton.title = "Stop playback";
   stopButton.setAttribute("aria-label", "Stop playback");
@@ -141,7 +153,7 @@
     borderRadius: "4px",
     padding: "0",
     fontFamily: "Verdana, sans-serif",
-    fontSize: "30px",
+    fontSize: "14px",
     cursor: "pointer"
   });
 
@@ -149,9 +161,11 @@
   // Assemble Playback Bar
   // ========================================
 
-  playbackBar.appendChild(repeatCounter);
-  playbackBar.appendChild(playbackText);
-  playbackBar.appendChild(stopButton);
+  playbackBar.append(
+    repeatCounter,
+    playbackText,
+    stopButton
+  );
 
   document.documentElement.appendChild(playbackBar);
 
@@ -171,6 +185,11 @@
 
   function stopPlayback() {
     currentToken++;
+
+    if (activePass) {
+      activePass.abort();
+    }
+
     synth.cancel();
     hidePlaybackBar();
   }
@@ -181,12 +200,13 @@
   // Detect Text Selection
   // ========================================
 
-  document.addEventListener("mouseup", (event) => {
+  document.addEventListener("mouseup", event => {
     if (
       event.target === button ||
       event.target === stopButton ||
       event.target === repeatCounter ||
-      event.target === playbackText
+      event.target === playbackText ||
+      playbackBar.contains(event.target)
     ) {
       return;
     }
@@ -198,7 +218,11 @@
       const selection = window.getSelection();
       const text = selection?.toString();
 
-      if (!text || !text.trim() || selection.rangeCount === 0) {
+      if (
+        !text ||
+        !text.trim() ||
+        selection.rangeCount === 0
+      ) {
         button.style.display = "none";
         return;
       }
@@ -219,7 +243,7 @@
   // Hide Floating Play Button
   // ========================================
 
-  document.addEventListener("mousedown", (event) => {
+  document.addEventListener("mousedown", event => {
     if (event.target !== button) {
       button.style.display = "none";
     }
@@ -232,8 +256,12 @@
   async function getVoices() {
     let voices = synth.getVoices();
 
-    for (let i = 0; i < 20 && voices.length === 0; i++) {
-      await new Promise(resolve => setTimeout(resolve, 200));
+    for (
+      let i = 0;
+      i < 20 && voices.length === 0;
+      i++
+    ) {
+      await wait(200);
       voices = synth.getVoices();
     }
 
@@ -241,22 +269,180 @@
   }
 
   // ========================================
-  // Speech Helper
+  // Wait for Speech Engine
   // ========================================
 
-  function speak(text, voice) {
-    return new Promise(resolve => {
-      const utterance = new SpeechSynthesisUtterance(text);
+  async function settleEngine(token) {
+    for (
+      let i = 0;
+      i < 10 && engineBusy();
+      i++
+    ) {
+      if (token !== currentToken) {
+        return false;
+      }
 
-      utterance.voice = voice;
-      utterance.lang = "en-US";
-      utterance.rate = RATE;
+      await wait(50);
+    }
 
-      utterance.onend = resolve;
-      utterance.onerror = resolve;
+    return token === currentToken;
+  }
 
-      synth.speak(utterance);
+  // ========================================
+  // Speech Helper with Timeout Protection
+  // ========================================
+
+  function speakPass(text, voice, token) {
+    let resolvePass;
+    let finished = false;
+    let started = false;
+    let attempts = 0;
+    let utterance = null;
+    let timer = null;
+    let sentAt = 0;
+
+    const promise = new Promise(resolve => {
+      resolvePass = resolve;
     });
+
+    function finish(status) {
+      if (finished) return;
+
+      finished = true;
+      clearInterval(timer);
+
+      if (activePass?.abort === abort) {
+        activePass = null;
+      }
+
+      if (
+        status !== "ok" &&
+        status !== "aborted"
+      ) {
+        console.warn(
+          "[Speech Repeater]",
+          status,
+          { text }
+        );
+      }
+
+      resolvePass(status);
+    }
+
+    function abort() {
+      finish("aborted");
+    }
+
+    function send() {
+      if (
+        finished ||
+        token !== currentToken
+      ) {
+        return finish("aborted");
+      }
+
+      attempts++;
+      started = false;
+      sentAt = performance.now();
+
+      const thisAttempt = attempts;
+
+      const item =
+        new SpeechSynthesisUtterance(text);
+
+      utterance = item;
+
+      item.voice = voice;
+      item.lang = "en-US";
+      item.rate = RATE;
+
+      item.onstart = () => {
+        if (
+          finished ||
+          thisAttempt !== attempts ||
+          token !== currentToken
+        ) {
+          return;
+        }
+
+        started = true;
+      };
+
+      item.onend = () => {
+        if (
+          finished ||
+          thisAttempt !== attempts ||
+          token !== currentToken
+        ) {
+          return;
+        }
+
+        finish("ok");
+      };
+
+      item.onerror = event => {
+        if (
+          finished ||
+          thisAttempt !== attempts ||
+          token !== currentToken
+        ) {
+          return;
+        }
+
+        finish(`error: ${event.error}`);
+      };
+
+      synth.speak(item);
+    }
+
+    activePass = { abort };
+
+    send();
+
+    timer = setInterval(() => {
+      if (finished) return;
+
+      if (token !== currentToken) {
+        return finish("aborted");
+      }
+
+      const elapsed =
+        performance.now() - sentAt;
+
+      // Speech has not started
+      if (!started) {
+        if (
+          !engineBusy() &&
+          elapsed >= 1500 &&
+          attempts < 2
+        ) {
+          send();
+          return;
+        }
+
+        if (elapsed >= START_TIMEOUT_MS) {
+          synth.cancel();
+          finish("start timeout");
+        }
+
+        return;
+      }
+
+      // Speech started but may not have ended
+      if (!engineBusy()) {
+        finish("ok");
+      } else if (
+        elapsed >=
+        END_TIMEOUT_BASE_MS +
+        text.length *
+        END_TIMEOUT_PER_CHARACTER_MS
+      ) {
+        synth.cancel();
+        finish("completion timeout");
+      }
+    }, 250);
+
+    return promise;
   }
 
   // ========================================
@@ -266,11 +452,7 @@
   button.addEventListener("click", async () => {
     button.style.display = "none";
 
-    const token = ++currentToken;
-
-    synth.cancel();
-
-    // Preserve the complete selection for clipboard
+    // Preserve complete selection
     const fullText = selectedText;
 
     // Read only the first line
@@ -278,13 +460,29 @@
       .split(/\r\n|\r|\n/)[0]
       .trim();
 
-    // Copy the complete selected text
+    // Force-stop previous playback
+    const wasBusy =
+      engineBusy() ||
+      activePass !== null;
+
+    stopPlayback();
+
+    const token = currentToken;
+
+    // Copy complete selected text
     if (navigator.clipboard?.writeText) {
-      navigator.clipboard.writeText(fullText).catch(error => {
-        console.error("Failed to copy selected text:", error);
-      });
+      navigator.clipboard
+        .writeText(fullText)
+        .catch(error => {
+          console.error(
+            "Failed to copy selected text:",
+            error
+          );
+        });
     } else {
-      console.warn("Clipboard API is not available on this page.");
+      console.warn(
+        "Clipboard API is not available on this page."
+      );
     }
 
     if (!text) return;
@@ -292,20 +490,35 @@
     // Show playback bar
     showPlaybackBar(text);
 
+    // Allow previous cancellation to settle
+    if (wasBusy) {
+      await wait(150);
+    }
+
+    if (!(await settleEngine(token))) {
+      return;
+    }
+
+    // Get voices
     const voices = await getVoices();
 
-    if (token !== currentToken) return;
+    if (token !== currentToken) {
+      return;
+    }
 
     const andrew = voices.find(v =>
-      v.name === ANDREW && v.lang === "en-US"
+      v.name === ANDREW &&
+      v.lang === "en-US"
     );
 
     const ava = voices.find(v =>
-      v.name === AVA && v.lang === "en-US"
+      v.name === AVA &&
+      v.lang === "en-US"
     );
 
     const emma = voices.find(v =>
-      v.name === EMMA && v.lang === "en-US"
+      v.name === EMMA &&
+      v.lang === "en-US"
     );
 
     if (!andrew || !ava || !emma) {
@@ -322,43 +535,78 @@
       return;
     }
 
-    // Calculate pause duration based on spaces
-    const spaceCount = (text.match(/ /g) || []).length;
-    const pauseDuration = spaceCount * PAUSE_PER_SPACE;
+    // Calculate pause duration
+    const spaceCount =
+      (text.match(/ /g) || []).length;
+
+    const pauseDuration =
+      spaceCount * PAUSE_PER_SPACE;
 
     // ========================================
     // Repeat Reading
     // ========================================
 
-    for (let i = 0; i < REPEAT_COUNT; i++) {
-      if (token !== currentToken) return;
+    for (
+      let i = 0;
+      i < REPEAT_COUNT;
+      i++
+    ) {
+      if (token !== currentToken) {
+        return;
+      }
 
-      // Update only the repetition counter
-      repeatCounter.textContent = String(i + 1);
+      if (!(await settleEngine(token))) {
+        return;
+      }
+
+      // Update repetition counter
+      repeatCounter.textContent =
+        String(i + 1);
 
       // Alternate Andrew and Ava
-      const voice = i % 2 === 0 ? andrew : ava;
+      const voice =
+        i % 2 === 0 ? andrew : ava;
 
-      await speak(text, voice);
+      const status =
+        await speakPass(text, voice, token);
 
-      if (token !== currentToken) return;
+      if (token !== currentToken) {
+        return;
+      }
 
-      // Pause after every repetition, including the last
-      await new Promise(resolve =>
-        setTimeout(resolve, pauseDuration)
-      );
+      if (status !== "ok") {
+        stopPlayback();
+        return;
+      }
+
+      // Pause after every repetition
+      await wait(pauseDuration);
     }
 
-    if (token !== currentToken) return;
+    if (token !== currentToken) {
+      return;
+    }
 
-    // Hide playback bar after completion
+    // ========================================
+    // Final Encouragement
+    // ========================================
+
+    // Hide bar before Emma says Good!
     hidePlaybackBar();
-    
-    // Final encouragement
-    await speak("Good!", emma);
 
-    if (token !== currentToken) return;
+    if (!(await settleEngine(token))) {
+      return;
+    }
 
-
+    await speakPass("Good!", emma, token);
   });
+
+  // ========================================
+  // Cleanup
+  // ========================================
+
+  window.addEventListener(
+    "pagehide",
+    stopPlayback
+  );
 })();
