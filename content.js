@@ -14,9 +14,23 @@
   const EMMA =
     "Microsoft Emma Multilingual Online (Natural) - English (United States)";
 
-  const REPEAT_COUNT = 10;
+  const BRIAN =
+    "Microsoft Brian Multilingual Online (Natural) - English (United States)";
+
+  // ========================================
+  // Repetition Mode
+  // ========================================
+
+  // 10: Andrew → Ava, repeated 5 times
+  //  8: Andrew → Emma → Brian → Ava, repeated 2 times
+  //
+  // Both modes end with Emma saying "Good!"
+
+  const REPEAT_MODE = 8;
+
   const RATE = 0.8;
-  const PAUSE_PER_SPACE = 300;
+  const ENDING_RATE = 1.0;
+  const PAUSE_PER_SPACE = 350;
 
   const BUTTON_OFFSET_X = -12;
   const BUTTON_OFFSET_Y = 8;
@@ -292,7 +306,7 @@
   // Speech Helper with Timeout Protection
   // ========================================
 
-  function speakPass(text, voice, token) {
+  function speakPass(text, voice, token, rate = RATE) {
     let resolvePass;
     let finished = false;
     let started = false;
@@ -354,7 +368,7 @@
 
       item.voice = voice;
       item.lang = "en-US";
-      item.rate = RATE;
+      item.rate = rate;
 
       item.onstart = () => {
         if (
@@ -446,6 +460,43 @@
   }
 
   // ========================================
+  // Build Repetition Sequence
+  // ========================================
+
+  function buildVoiceSequence(andrew, ava, emma, brian) {
+    if (REPEAT_MODE === 10) {
+      // Original mode:
+      // Andrew → Ava × 5
+
+      return Array.from(
+        { length: 10 },
+        (_, i) => i % 2 === 0 ? andrew : ava
+      );
+    }
+
+    if (REPEAT_MODE === 8) {
+      // New mode:
+      // Andrew → Emma → Brian → Ava × 2
+
+      const sequence = [
+        andrew,
+        emma,
+        brian,
+        ava
+      ];
+
+      return [
+        ...sequence,
+        ...sequence
+      ];
+    }
+
+    throw new Error(
+      `Unsupported repetition mode: ${REPEAT_MODE}`
+    );
+  }
+
+  // ========================================
   // Start Reading and Copy Text
   // ========================================
 
@@ -499,7 +550,10 @@
       return;
     }
 
-    // Get voices
+    // ========================================
+    // Get Voices
+    // ========================================
+
     const voices = await getVoices();
 
     if (token !== currentToken) {
@@ -521,19 +575,41 @@
       v.lang === "en-US"
     );
 
-    if (!andrew || !ava || !emma) {
+    const brian = voices.find(v =>
+      v.name === BRIAN &&
+      v.lang === "en-US"
+    );
+
+    // Only require voices used by the selected mode
+    const requiredVoices =
+      REPEAT_MODE === 8
+        ? { Andrew: andrew, Emma: emma, Brian: brian, Ava: ava }
+        : { Andrew: andrew, Ava: ava, Emma: emma };
+
+    const missingVoices = Object.entries(requiredVoices)
+      .filter(([, voice]) => !voice)
+      .map(([name]) => name);
+
+    if (missingVoices.length > 0) {
       console.error(
         "Required Microsoft voices not found:",
-        {
-          Andrew: !!andrew,
-          Ava: !!ava,
-          Emma: !!emma
-        }
+        missingVoices
       );
 
       hidePlaybackBar();
       return;
     }
+
+    // ========================================
+    // Build Sequence
+    // ========================================
+
+    const voiceSequence = buildVoiceSequence(
+      andrew,
+      ava,
+      emma,
+      brian
+    );
 
     // Calculate pause duration
     const spaceCount =
@@ -548,7 +624,7 @@
 
     for (
       let i = 0;
-      i < REPEAT_COUNT;
+      i < voiceSequence.length;
       i++
     ) {
       if (token !== currentToken) {
@@ -563,9 +639,8 @@
       repeatCounter.textContent =
         String(i + 1);
 
-      // Alternate Andrew and Ava
-      const voice =
-        i % 2 === 0 ? andrew : ava;
+      // Use voice from selected sequence
+      const voice = voiceSequence[i];
 
       const status =
         await speakPass(text, voice, token);
@@ -598,7 +673,7 @@
       return;
     }
 
-    await speakPass("Good!", emma, token);
+    await speakPass("Good!", emma, token, ENDING_RATE);
   });
 
   // ========================================
